@@ -1,9 +1,10 @@
 {
-  "name": "cookieclicker-proxy",
+  "name": "cookieclicker-proxy-mirror",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "mirror": "node mirror-assets.js"
   },
   "dependencies": {
     "express": "^4.18.2",
