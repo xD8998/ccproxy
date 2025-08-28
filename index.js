@@ -4,31 +4,34 @@ import { createProxyMiddleware } from "http-proxy-middleware";
 
 const app = express();
 
-// Proxy everything under /cookieclicker
 app.use(
   "/cookieclicker",
   createProxyMiddleware({
-    target: "https://orteil.dashnet.org", // original Cookie Clicker site
+    target: "https://orteil.dashnet.org",
     changeOrigin: true,
-    pathRewrite: {
-      "^/cookieclicker": "/cookieclicker", // keeps the original path
+    secure: false,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+      Referer: "https://orteil.dashnet.org/",
     },
-    onProxyRes(proxyRes, req, res) {
-      // Optional: modify headers for CORS or cache
-      res.setHeader("Access-Control-Allow-Origin", "*");
+    pathRewrite: {
+      "^/cookieclicker": "/cookieclicker",
+    },
+    onProxyRes(proxyRes) {
+      // allow loading assets from your Railway proxy
+      delete proxyRes.headers["content-security-policy"];
+      delete proxyRes.headers["x-frame-options"];
     },
   })
 );
 
-// Root route
 app.get("/", (req, res) => {
-  res.send(`
-    <h1>Cookie Clicker Proxy</h1>
-    <p>Visit <a href="/cookieclicker">/cookieclicker</a> to play!</p>
-  `);
+  res.send(`<h1>Cookie Clicker Proxy</h1>
+  <p><a href="/cookieclicker">Play Cookie Clicker</a></p>`);
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Proxy server running on port ${PORT}`);
+  console.log(`Proxy running on ${PORT}`);
 });
