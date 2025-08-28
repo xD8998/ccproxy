@@ -1,19 +1,16 @@
-// index.js
+// index.js  (patched)
 import express from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
-import { request as undiciRequest } from "undici";
 import zlib from "zlib";
 import NodeCache from "node-cache";
 import { URL } from "url";
 
 const app = express();
-const cache = new NodeCache({ stdTTL: 60 * 60 }); // cache 1 hour for static assets
+const cache = new NodeCache({ stdTTL: 60 * 60 });
 
 const PROXY_PREFIX = "/cookieclicker";
 const ORTEIL = "https://orteil.dashnet.org";
 
-// Allowlist of hostnames your proxy will fetch for the game.
-// Add any hosts you see in devtools (fonts, cdn, analytics if you want).
 const ALLOWED_HOSTS = new Set([
   "orteil.dashnet.org",
   "dashnet.org",
@@ -22,104 +19,72 @@ const ALLOWED_HOSTS = new Set([
   "fonts.gstatic.com",
   "cdn.jsdelivr.net",
   "cdnjs.cloudflare.com",
-  // add more trusted hosts if required
 ]);
 
-/**
- * Helper: safe fetch from backend using undici.
- * Returns { statusCode, headers, bodyBuffer }.
- */
-async function backendFetch(url, opts = {}) {
-  // simple cache key
-  const ck = `fetch:${url}`;
-  if (!opts.noCache) {
-    const cached = cache.get(ck);
-    if (cached) return cached;
-  }
-
-  const res = await undiciRequest(url, {
-    method: opts.method || "GET",
-    headers: opts.headers || {},
-    body: opts.body || undefined,
-    throwOnError: true,
-    maxRedirections: 5,
-  });
-
-  const { statusCode, headers } = res;
-  const chunks = [];
-  for await (const chunk of res.body) chunks.push(chunk);
-  const bodyBuffer = Buffer.concat(chunks);
-
-  const out = { statusCode, headers, bodyBuffer };
-  if (!opts.noCache && (headers["content-type"] || "").includes("image") || (headers["cache-control"] || "").includes("max-age")) {
-    cache.set(ck, out);
-  }
-  return out;
+function isCloudflareChallengeStatus(status, bodyStr) {
+  if (!status) return false;
+  if (status === 503 || status === 429) return true;
+  if (!bodyStr) return false;
+  const s = bodyStr.toLowerCase();
+  return s.includes("__cf_chl_rt_tk") ||
+         s.includes("cf_chl_") ||
+         s.includes("cf-browser-verification") ||
+         s.includes("ddos protection") ||
+         s.includes("checking your browser before accessing");
 }
 
-/**
- * Rewrite HTML to force absolute URLs through proxy and remove SRI / CSP headers that block injection.
- */
-function rewriteHtml(body, proxyBase = PROXY_PREFIX) {
-  let s = body;
-
-  // rewrite absolute references to the main host
+function rewriteText(bodyStr, proxyBase = PROXY_PREFIX) {
+  let s = bodyStr;
   s = s.replace(/https?:\/\/orteil\.dashnet\.org\/cookieclicker/g, proxyBase);
   s = s.replace(/https?:\/\/orteil\.dashnet\.org/g, proxyBase);
+  s = s.replace(/https?:\/\/dashnet\.org/g, proxyBase);
 
-  // rewrite other allowed hosts to go via /fetch?url=<encoded>
-  // e.g., https://fonts.gstatic.com/... -> /fetch?url=https%3A%2F%2Ffonts.gstatic.com%2F...
+  // rewrite common CDNs to /fetch
   s = s.replace(/https?:\/\/(ajax\.googleapis\.com|fonts\.googleapis\.com|fonts\.gstatic\.com|cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com)(\/[^\s"'<>]*)/g, (m) => {
-    const encoded = encodeURIComponent(m);
-    return `/fetch?url=${encoded}`;
+    return `/fetch?url=${encodeURIComponent(m)}`;
   });
 
-  // strip integrity attributes to allow modified scripts to load from proxy
+  // strip SRI attributes
   s = s.replace(/\sintegrity="[^"]*"/g, "");
   s = s.replace(/\scrossorigin="[^"]*"/g, "");
 
-  // fix src/href that start with // (protocol-relative)
-  s = s.replace(/src=["']\/\/(.*?)["']/g, (m, g1) => {
-    const url = `https://${g1}`;
-    return `src="/fetch?url=${encodeURIComponent(url)}"`;
-  });
-  s = s.replace(/href=["']\/\/(.*?)["']/g, (m, g1) => {
-    const url = `https://${g1}`;
-    return `href="/fetch?url=${encodeURIComponent(url)}"`;
-  });
-
-  // optional: inject a small banner/script to ensure all in-page AJAX also goes via proxy prefix
-  const injection = `
-  <!-- proxied by your Railway proxy -->
+  // inject a tiny script to prevent direct-location navigation from JS
+  const safeScript = `
   <script>
-    // rewrite fetch/XHR targets in-page (best-effort)
+    // Prevent scripts from sending the user off to the original domain by rewriting assignments
     (function(){
-      const base = "${PROXY_PREFIX}";
-      // patch fetch
-      const origFetch = window.fetch;
-      window.fetch = function(input, init){
+      const PROXY = "${PROXY_PREFIX}";
+      const ORIG = "https://orteil.dashnet.org";
+      // Override location setters
+      const setLocation = (dest) => {
         try {
-          const url = (typeof input === "string") ? input : input.url;
-          if (url && url.includes("orteil.dashnet.org")) {
-            const newUrl = url.replace(/https?:\\/\\/orteil\\.dashnet\\.org/g, base);
-            return origFetch.call(this, newUrl, init);
+          if (typeof dest === "string" && dest.includes("orteil.dashnet.org")) {
+            dest = dest.replace(/https?:\\/\\/orteil\\.dashnet\\.org/g, PROXY);
           }
         } catch(e){}
-        return origFetch.call(this, input, init);
+        return dest;
       };
+      const origAssign = window.location.assign;
+      const origReplace = window.location.replace;
+      Object.defineProperty(window.location, "assign", {
+        configurable: true,
+        value: function(u){ return origAssign.call(this, setLocation(u)); }
+      });
+      Object.defineProperty(window.location, "replace", {
+        configurable: true,
+        value: function(u){ return origReplace.call(this, setLocation(u)); }
+      });
+      const origOpen = window.open;
+      window.open = function(u, n, opts){ return origOpen.call(this, setLocation(u), n, opts); };
     })();
   </script>
   `;
 
-  // inject before </head>
-  s = s.replace(/<\/head>/i, injection + "</head>");
-
+  // Try placing the script before </head> if HTML
+  if (s.includes("</head>")) s = s.replace(/<\/head>/i, safeScript + "</head>");
   return s;
 }
 
-/**
- * Main cookieclicker proxy: uses createProxyMiddleware to handle ws and pass-thru, but selfHandleResponse to rewrite HTML.
- */
 app.use(
   PROXY_PREFIX,
   createProxyMiddleware({
@@ -129,121 +94,102 @@ app.use(
     ws: true,
     selfHandleResponse: true,
     onProxyReq(proxyReq, req, res) {
-      // Make the request appear like a normal browser
       proxyReq.setHeader("User-Agent", req.get("User-Agent") || "Mozilla/5.0");
       proxyReq.setHeader("Referer", ORTEIL + "/");
-      // host header: set to original so server serves same content
       proxyReq.setHeader("Host", "orteil.dashnet.org");
     },
     async onProxyRes(proxyRes, req, res) {
-      // rewrite Location headers for redirects
-      if (proxyRes.headers && proxyRes.headers.location) {
-        proxyRes.headers.location = proxyRes.headers.location.replace(/https?:\/\/orteil\.dashnet\.org/g, PROXY_PREFIX);
-      }
+      try {
+        // collect raw chunks
+        const chunks = [];
+        for await (const chunk of proxyRes) chunks.push(chunk);
+        let buffer = Buffer.concat(chunks || []);
+        const contentEncoding = (proxyRes.headers["content-encoding"] || "").toLowerCase();
+        const contentType = (proxyRes.headers["content-type"] || "").toLowerCase();
 
-      // remove blocking headers
-      if (proxyRes.headers) {
-        delete proxyRes.headers["content-security-policy"];
-        delete proxyRes.headers["x-frame-options"];
-        delete proxyRes.headers["x-xss-protection"];
-      }
+        // decompress if needed
+        let decoded = buffer;
+        try {
+          if (contentEncoding === "gzip") decoded = zlib.gunzipSync(buffer);
+          else if (contentEncoding === "deflate") decoded = zlib.inflateSync(buffer);
+          else if (contentEncoding === "br") decoded = zlib.brotliDecompressSync(buffer);
+        } catch (e) {
+          // decompression may fail for binary content - keep original buffer
+          decoded = buffer;
+        }
 
-      const ctype = (proxyRes.headers["content-type"] || "").toLowerCase();
-      const isHtml = ctype.includes("text/html");
+        const decodedStr = decoded.toString("utf8");
 
-      // For non-html: stream through but copy headers (images, js, css)
-      if (!isHtml) {
+        // Detect cloudflare challenge — if it looks like one, forward raw (so client runs CF JS)
+        if (isCloudflareChallengeStatus(proxyRes.statusCode, decodedStr)) {
+          // Copy headers (including set-cookie) so browser can solve challenge
+          Object.entries(proxyRes.headers || {}).forEach(([k, v]) => {
+            // keep set-cookie so browser receives cookies
+            res.setHeader(k, v);
+          });
+          res.statusCode = proxyRes.statusCode || 200;
+          // Send raw (re-encode if original was compressed)
+          if (contentEncoding === "gzip") {
+            res.setHeader("content-encoding", "gzip");
+            res.end(buffer);
+          } else if (contentEncoding === "br") {
+            res.setHeader("content-encoding", "br");
+            res.end(buffer);
+          } else {
+            res.end(decoded);
+          }
+          return;
+        }
+
+        // Not a challenge: handle rewrites.
+        // If text-like: rewriteJS/HTML/CSS
+        if (contentType.includes("text/html") || contentType.includes("javascript") || contentType.includes("css") || contentType.includes("application/json") || contentType.includes("text/plain")) {
+          const rewritten = rewriteText(decodedStr, PROXY_PREFIX);
+
+          // re-encode if needed
+          let outBuffer = Buffer.from(rewritten, "utf8");
+          if (contentEncoding === "gzip") outBuffer = zlib.gzipSync(outBuffer);
+          else if (contentEncoding === "deflate") outBuffer = zlib.deflateSync(outBuffer);
+          else if (contentEncoding === "br") outBuffer = zlib.brotliCompressSync(outBuffer);
+
+          // copy through headers but ensure content-length and encoding are correct
+          Object.entries(proxyRes.headers || {}).forEach(([k, v]) => {
+            const lk = k.toLowerCase();
+            if (lk === "content-length") return;
+            if (lk === "content-security-policy" || lk === "x-frame-options") return;
+            // keep set-cookie so CF cookies can be set
+            res.setHeader(k, v);
+          });
+          res.setHeader("content-length", outBuffer.length);
+          if (proxyRes.headers["content-encoding"]) res.setHeader("content-encoding", proxyRes.headers["content-encoding"]);
+          res.statusCode = proxyRes.statusCode || 200;
+          res.end(outBuffer);
+          return;
+        }
+
+        // Binary / other: stream raw (images, audio, etc.)
         Object.entries(proxyRes.headers || {}).forEach(([k, v]) => {
           if (k.toLowerCase() === "content-length") return;
           res.setHeader(k, v);
         });
         res.statusCode = proxyRes.statusCode || 200;
+        res.end(buffer);
+      } catch (err) {
+        console.error("proxy onProxyRes error", err);
+        // fallback: pipe original stream (if possible)
         proxyRes.pipe(res);
-        return;
       }
-
-      // collect body
-      const chunks = [];
-      proxyRes.on("data", (c) => chunks.push(c));
-      proxyRes.on("end", async () => {
-        try {
-          let buffer = Buffer.concat(chunks);
-          const enc = (proxyRes.headers["content-encoding"] || "").toLowerCase();
-
-          if (enc === "gzip") buffer = zlib.gunzipSync(buffer);
-          else if (enc === "deflate") buffer = zlib.inflateSync(buffer);
-          else if (enc === "br") buffer = zlib.brotliDecompressSync(buffer);
-
-          let body = buffer.toString("utf8");
-
-          // rewrite html
-          body = rewriteHtml(body, PROXY_PREFIX);
-
-          // re-encode as needed
-          let out = Buffer.from(body, "utf8");
-          if (enc === "gzip") out = zlib.gzipSync(out);
-          else if (enc === "deflate") out = zlib.deflateSync(out);
-          else if (enc === "br") out = zlib.brotliCompressSync(out);
-
-          // copy headers except content-length/csp
-          Object.entries(proxyRes.headers || {}).forEach(([k, v]) => {
-            const lk = k.toLowerCase();
-            if (lk === "content-length" || lk === "content-security-policy" || lk === "x-frame-options") return;
-            res.setHeader(k, v);
-          });
-
-          res.setHeader("content-length", out.length);
-          if (proxyRes.headers["content-encoding"]) res.setHeader("content-encoding", proxyRes.headers["content-encoding"]);
-          res.statusCode = proxyRes.statusCode || 200;
-          res.end(out);
-        } catch (err) {
-          console.error("HTML rewrite error", err);
-          proxyRes.pipe(res);
-        }
-      });
     },
     pathRewrite: {
-      // keep /cookieclicker -> /cookieclicker at target
       [`^${PROXY_PREFIX}`]: "/cookieclicker",
     },
   })
 );
 
-/**
- * Generic fetch endpoint: /fetch?url=<encodedUrl>
- * This lets us proxy fonts/CDN/etc which are not on orteil host.
- * Only allowed for ALLOWED_HOSTS.
- */
+// keep your /fetch endpoint (no change here in this snippet)
 app.get("/fetch", async (req, res) => {
-  const raw = req.query.url;
-  if (!raw) return res.status(400).send("missing url");
-  const url = decodeURIComponent(raw);
-  try {
-    const parsed = new URL(url);
-    if (!ALLOWED_HOSTS.has(parsed.hostname)) return res.status(403).send("host not allowed");
-
-    const { statusCode, headers, bodyBuffer } = await backendFetch(url, { noCache: false });
-
-    // remove problematic headers
-    const outHeaders = { ...headers };
-    delete outHeaders["content-security-policy"];
-    delete outHeaders["x-frame-options"];
-    delete outHeaders["set-cookie"]; // we don't want to forward origin cookies
-    Object.entries(outHeaders).forEach(([k, v]) => res.setHeader(k, v));
-
-    res.status(statusCode).send(bodyBuffer);
-  } catch (err) {
-    console.error("fetch error", err);
-    res.status(502).send("bad gateway");
-  }
-});
-
-// Root landing
-app.get("/", (req, res) => {
-  res.send(`<h1>Cookie Clicker Proxy</h1>
-    <p><a href="${PROXY_PREFIX}/">Play Cookie Clicker (via proxy)</a></p>
-    <p>Note: This proxy only fetches from allowed hosts.</p>
-  `);
+  // previous implementation...
+  res.status(501).send("fetch not implemented in snippet - use existing implementation");
 });
 
 const PORT = process.env.PORT || 3000;
